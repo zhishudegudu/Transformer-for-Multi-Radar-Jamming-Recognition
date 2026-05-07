@@ -1,0 +1,30 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+
+# Training outputs and checkpoints
+log-TR*/
+*.pth
+*.pt
+*.ckpt
+
+# Generated datasets and figures
+synthetic_data*/
+figures*/
+*.mat
+
+# Local experiment notes/backups
+session_backup_*.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

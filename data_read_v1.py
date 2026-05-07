@@ -7,6 +7,24 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
+def split_iq_components(mat_data):
+    """Split raw MATLAB data into real/imag arrays with the same base shape."""
+    if np.iscomplexobj(mat_data):
+        return np.real(mat_data).astype(np.float64), np.imag(mat_data).astype(np.float64)
+
+    if mat_data.dtype != object and mat_data.ndim >= 1 and mat_data.shape[-1] == 2:
+        return mat_data[..., 0].astype(np.float64), mat_data[..., 1].astype(np.float64)
+
+    if mat_data.dtype == object:
+        flat = [np.asarray(x).reshape(-1) for x in mat_data.flat]
+        if len(flat) == 0 or flat[0].size < 2:
+            raise ValueError("Unsupported object-cell IQ format: each element must contain at least 2 values.")
+        real_part = np.array([v[0] for v in flat], dtype=np.float64).reshape(mat_data.shape)
+        imag_part = np.array([v[1] for v in flat], dtype=np.float64).reshape(mat_data.shape)
+        return real_part, imag_part
+
+    raise ValueError("Unsupported IQ data format; expected complex, last-dim=2, or object-cell IQ pairs.")
+
 class RadarDataset(Dataset):
     def __init__(self, data, labels):
         self.data = data
@@ -19,7 +37,7 @@ class RadarDataset(Dataset):
         return self.data[idx], self.labels[idx]
 
 def get_data(args):
-    file_names = os.listdir(args.datapath)
+    file_names = sorted(os.listdir(args.datapath))
     all_data = []
     all_labels = []
 
@@ -43,13 +61,8 @@ def get_data(args):
                 continue
         
         
-        # 拆分实部和虚部，形状变为2*3*1000*16000
-        # real_part = np.real(mat_data)
-        # imag_part = np.imag(mat_data)
-        flat_data = np.array([x[0] for x in mat_data.flat], dtype=np.float64)
-        real_part = flat_data.reshape(mat_data.shape)
-        flat_data = np.array([x[1] for x in mat_data.flat], dtype=np.float64)
-        imag_part =  flat_data.reshape(mat_data.shape)
+        # 拆分实部和虚部，兼容complex、最后一维为2、以及object-cell IQ格式
+        real_part, imag_part = split_iq_components(mat_data)
 
         combined_data = np.stack((real_part, imag_part), axis=0)
         
@@ -76,8 +89,9 @@ def load_data(all_data, args):
         # 按照配置采样数量或比例提取样本
         if args.train_size<1.0:
             sample_num = int(period_data.shape[1] * args.train_size)         
-        elif args.train_size>1.0:
+        elif args.train_size>=1.0:
             sample_num = int(args.train_size)
+        sample_num = max(1, min(sample_num, period_data.shape[1] - 1))
         
         train_indices = sample_indices[:sample_num]
         test_indices = sample_indices[sample_num:]    

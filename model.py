@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,13 +11,13 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, num_nodes, num_groups):
         super().__init__()
         # pos_embedding: [num_nodes, num_groups, d_model]，对应文档e^(pos)_(p,b)
-        self.pos_embedding = nn.Parameter(torch.randn(num_nodes, num_groups, d_model), requires_grad=False)
-        self.d_model = d_model
+        self.pos_embedding = nn.Parameter(torch.randn(num_nodes, num_groups, d_model))
+        self.scale = math.sqrt(d_model)
 
     def forward(self, x):
         # x: [batch_size, num_nodes, num_groups, d_model]
         # 位置编码与特征编码相加（文档公式5-1：z = E*x + e^(pos)）
-        return x * torch.sqrt(torch.tensor(self.d_model, dtype=torch.float32)) + self.pos_embedding
+        return x * self.scale + self.pos_embedding
     
     
 class SeparableSelfAttention(nn.Module):
@@ -43,7 +45,7 @@ class SeparableSelfAttention(nn.Module):
 
     def scaled_dot_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """对应文档公式(5-5)：缩放点积注意力计算"""
-        attn_score = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k, dtype=torch.float32))
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         attn_weight = F.softmax(attn_score, dim=-1)  # 文档SM()
         attn_weight = self.dropout(attn_weight)
         return torch.matmul(attn_weight, v)  # 文档公式(5-6)的特征加权
@@ -121,7 +123,7 @@ class FusionVectorCrossAttention(nn.Module):
         return fusion_vec_updated
 
     def scaled_dot_attn(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        attn_score = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k, dtype=torch.float32))
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         attn_weight = F.softmax(attn_score, dim=-1)
         attn_weight = self.dropout(attn_weight)
         return torch.matmul(attn_weight, v)
@@ -140,7 +142,305 @@ class MLP(nn.Module):
         # 残差连接（公式5-9）：x + MLP(LN(x))
         out = self.fc2(self.dropout(self.act(self.fc1(self.norm(x)))))
         return x + out
-    
+
+
+class DynamicNodeSignalFusion(nn.Module):
+    """按样本自适应地融合原始节点信号。"""
+    def __init__(self, input_dim: int, hidden_dim: int = 16):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, num_nodes, seq_len, input_dim]
+        weights = F.softmax(self.score(x), dim=1)
+        return torch.sum(x * weights, dim=1, keepdim=True)
+
+
+class DynamicNodeTokenFusion(nn.Module):
+    """按样本和token自适应地融合节点特征。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model // 2, 16)
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, num_nodes, num_groups, d_model]
+        weights = F.softmax(self.score(x), dim=1)
+        return torch.sum(x * weights, dim=1, keepdim=True)
+
+
+class DynamicNodeFeatureFusion(nn.Module):
+    """按样本自适应地融合节点级全局特征。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model // 2, 16)
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, num_nodes, d_model]
+        weights = F.softmax(self.score(x), dim=1)
+        return torch.sum(x * weights, dim=1)
+
+
+class ReliabilityAwareNodeFusion(nn.Module):
+    """结合节点特征与质量统计量的可靠性加权融合。"""
+    def __init__(self, d_model: int, stat_dim: int = 4, hidden_dim: int | None = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model // 2, 16)
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model + stat_dim),
+            nn.Linear(d_model + stat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        weights = F.softmax(self.score(torch.cat([x, stats], dim=-1)), dim=1)
+        fused = torch.sum(x * weights, dim=1)
+        return fused, weights.squeeze(-1)
+
+
+class CrossNodeCoAttentionBlock(nn.Module):
+    """在节点维上做自注意力，让不同雷达节点先交互再融合。"""
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1, mlp_ratio: int = 2):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.drop = nn.Dropout(dropout)
+        hidden_dim = max(d_model * mlp_ratio, d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+        x = x + self.drop(attn_out)
+        return x + self.ffn(self.norm2(x))
+
+
+def flatten_periods_as_sequence(x: torch.Tensor) -> torch.Tensor:
+    """将 period 维按时间顺序拼回完整时序，避免过早压缩长时序信息。"""
+    batch_size, num_nodes, seq_len, input_dim, num_periods = x.shape
+    return x.permute(0, 1, 4, 2, 3).reshape(batch_size, num_nodes, seq_len * num_periods, input_dim)
+
+
+class TemporalConvStem(nn.Module):
+    """轻量局部时序前端，先抽取短程纹理，再交给 Transformer 建模长依赖。"""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=7, padding=3),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class IQDenoiseStem(nn.Module):
+    """低SNR场景下的轻量IQ去噪残差前端。"""
+    def __init__(self, input_dim: int = 2, hidden_dim: int = 16, dropout: float = 0.05):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, input_dim, kernel_size=5, padding=2),
+            nn.Dropout(dropout),
+        )
+        self.res_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, input_dim, seq_len]
+        return x + self.res_scale * self.net(x)
+
+
+def build_complex_spectrogram(x: torch.Tensor, n_fft: int = 64, hop_length: int = 16) -> torch.Tensor:
+    """对 IQ 复信号做滑窗 FFT，构造简化时频谱。"""
+    complex_x = torch.complex(x[..., 0], x[..., 1])
+    frames = complex_x.unfold(dimension=-1, size=n_fft, step=hop_length)
+    window = torch.hann_window(n_fft, device=x.device, dtype=x[..., 0].dtype).view(1, 1, 1, -1)
+    spec = torch.fft.fft(frames * window, n=n_fft, dim=-1)
+    return torch.log1p(torch.abs(spec).float())
+
+
+class DomainFeatureFusion(nn.Module):
+    """自适应融合时域和频域的节点级特征。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model, 32)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, time_feat: torch.Tensor, freq_feat: torch.Tensor) -> torch.Tensor:
+        gate = torch.sigmoid(self.gate(torch.cat([time_feat, freq_feat], dim=-1)))
+        return gate * time_feat + (1.0 - gate) * freq_feat
+
+
+class GatedInteractionFusion(nn.Module):
+    """门控 + 显式时频交互项的轻量升级版。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model, 32)
+        self.inter_proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        self.weight_net = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, time_feat: torch.Tensor, freq_feat: torch.Tensor) -> torch.Tensor:
+        inter_feat = self.inter_proj(time_feat * freq_feat)
+        weights = F.softmax(self.weight_net(torch.cat([time_feat, freq_feat, inter_feat], dim=-1)), dim=-1)
+        return (
+            weights[:, 0:1] * time_feat
+            + weights[:, 1:2] * freq_feat
+            + weights[:, 2:3] * inter_feat
+        )
+
+
+class CrossGatedInteractionFusion(nn.Module):
+    """较复杂的交叉门控交互融合：先互相调制，再做三分支自适应融合。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model, 32)
+        self.time_gate = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.freq_gate = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+        self.inter_proj = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.mix_score = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, time_feat: torch.Tensor, freq_feat: torch.Tensor) -> torch.Tensor:
+        time_enh = time_feat * self.time_gate(freq_feat)
+        freq_enh = freq_feat * self.freq_gate(time_feat)
+        inter_feat = self.inter_proj(torch.cat([time_feat * freq_feat, torch.abs(time_feat - freq_feat)], dim=-1))
+        weights = F.softmax(self.mix_score(torch.cat([time_enh, freq_enh, inter_feat], dim=-1)), dim=-1)
+        return (
+            weights[:, 0:1] * time_enh
+            + weights[:, 1:2] * freq_enh
+            + weights[:, 2:3] * inter_feat
+        )
+
+
+class TimeFreqCrossAttentionBlock(nn.Module):
+    """时域token向频域token发起单向交叉注意力，实现池化前的深度时频对齐。"""
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1, mlp_ratio: int = 2):
+        super().__init__()
+        self.time_norm = nn.LayerNorm(d_model)
+        self.freq_norm = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_drop = nn.Dropout(dropout)
+        hidden_dim = max(d_model * mlp_ratio, d_model)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, time_tokens: torch.Tensor, freq_tokens: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.cross_attn(
+            query=self.time_norm(time_tokens),
+            key=self.freq_norm(freq_tokens),
+            value=self.freq_norm(freq_tokens),
+            need_weights=False,
+        )
+        time_tokens = time_tokens + self.attn_drop(attn_out)
+        return time_tokens + self.ffn(self.ffn_norm(time_tokens))
+
+
+class ScaleFeatureFusion(nn.Module):
+    """自适应融合不同频谱尺度的特征。"""
+    def __init__(self, d_model: int, hidden_dim: int = None):
+        super().__init__()
+        hidden_dim = hidden_dim or max(d_model, 32)
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = F.softmax(self.score(x), dim=1)
+        return torch.sum(x * weights, dim=1)
+
+
+class CosineClassifier(nn.Module):
+    """Normalized cosine classifier for small-sample settings."""
+    def __init__(self, feat_dim: int, num_classes: int, init_scale: float = 10.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_classes, feat_dim))
+        self.scale = nn.Parameter(torch.tensor(float(init_scale), dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.normalize(x, dim=-1)
+        w = F.normalize(self.weight, dim=-1)
+        return self.scale * torch.matmul(x, w.t())
+
+
 class RadarInterferenceModel_Scheme1(nn.Module):
     """方案1：维度分离注意力 + 视图维融合（对齐文档基础框架）"""
     def __init__(self, 
@@ -178,7 +478,7 @@ class RadarInterferenceModel_Scheme1(nn.Module):
         ])
 
         # 5. 视图维融合（您的方案：线性层/平均，此处提供两种选择）
-        self.node_fusion = nn.Linear(num_nodes, 1)  # 线性融合
+        self.node_fusion = DynamicNodeTokenFusion(d_model)
         # self.node_fusion = lambda x: x.mean(dim=1, keepdim=True)  # 平均融合（注释切换）
 
         # 6. 分类头
@@ -212,7 +512,7 @@ class RadarInterferenceModel_Scheme1(nn.Module):
 
         # -------------------------- 6. 视图维融合（您的方案）--------------------------
         # 按视图维融合：[batch_size, 1, num_groups, d_model]
-        x = self.node_fusion(x.permute(0,2,3,1)).permute(0,3,1,2).squeeze(1)
+        x = self.node_fusion(x).squeeze(1)
         # Token维平均：[batch_size, d_model]
         x = x.mean(dim=1)
 
@@ -322,7 +622,7 @@ class RadarInterferenceModel_Scheme3(nn.Module):
 
         # 2. 节点融合（基础级：平均/可学习加权）
         if self.fusion_type == "weighted":
-            self.node_fusion = nn.Linear(num_nodes, 1)  # 3节点→1节点（可学习权重）
+            self.node_fusion = DynamicNodeSignalFusion(input_dim)  # 3节点→1节点（动态权重）
         # 平均融合无需参数，forward中直接计算均值
 
         # 3. 1DCNN分块（对应文档“分组展平”，替换线性层）
@@ -334,7 +634,7 @@ class RadarInterferenceModel_Scheme3(nn.Module):
 
         # 5. 基础Transformer Block（文档若干编码模块）
         self.blocks = nn.ModuleList([
-            Block(d_model, nhead, mlp_ratio, drop=dropout,attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
+            Block(d_model, nhead, mlp_ratio, proj_drop=dropout, attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
             for i in range(num_blocks)])
 
         # 6. 分类头
@@ -353,7 +653,7 @@ class RadarInterferenceModel_Scheme3(nn.Module):
         # 2. 节点融合（基础级）：(N,3,2000,2)→(N,1,2000,2)
         if self.fusion_type == "weighted":
             # 维度调整：(N,3,2000,2)→(N,2000,2,3)→线性融合→(N,2000,2,1)→(N,1,2000,2)
-            x = self.node_fusion(x.permute(0,2,3,1)).permute(0,3,1,2)
+            x = self.node_fusion(x)
         else:  # 平均融合
             x = x.mean(dim=1, keepdim=True)  # (N,3,2000,2)→(N,1,2000,2)
 
@@ -406,11 +706,11 @@ class RadarInterferenceModel_Scheme4(nn.Module):
 
         # 4. 共享Transformer Block（3节点共享编码模块，文档第12段）
         self.shared_blocks = nn.ModuleList([
-            Block(d_model, nhead, mlp_ratio, drop=dropout,attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
+            Block(d_model, nhead, mlp_ratio, proj_drop=dropout, attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
             for i in range(num_blocks)])
 
         # 5. 节点特征加权融合（可学习权重，文档第31段“融合向量”思路）
-        self.node_fusion = nn.Linear(num_nodes, 1)
+        self.node_fusion = DynamicNodeTokenFusion(d_model)
 
         # 6. 分类头
         self.classifier = nn.Sequential(
@@ -443,7 +743,7 @@ class RadarInterferenceModel_Scheme4(nn.Module):
         x = x.reshape(N, num_nodes, self.num_groups, self.d_model)  # 恢复节点维
 
         # 5. 节点特征融合：(N,3,num_groups,d_model)→(N,1,num_groups,d_model)→(N,num_groups,d_model)
-        x = self.node_fusion(x.permute(0,2,3,1)).permute(0,3,1,2).squeeze(1)
+        x = self.node_fusion(x).squeeze(1)
 
         # 6. 分类
         x = x.mean(dim=1)  # (N, d_model)
@@ -451,86 +751,200 @@ class RadarInterferenceModel_Scheme4(nn.Module):
 
 # -------------------------- 方案5：独立Transformer提取特征→加权融合 --------------------------
 class RadarInterferenceModel_Scheme5(nn.Module):
-    """方案5：3节点各用独立Transformer→特征加权融合"""
+    """方案5创新版：完整时序 + 时频双分支 + 类中心友好的判别特征头。"""
     def __init__(self, 
-                input_dim: int = 2,  # 实部+虚部
-                 input_period: int = 8,  # 雷达周期数
-                 patch_size: int = 16,  # Token分块尺寸
-                 stride: int = 16,  # 卷积步长
-                 seq_len: int = 2000,  # 单脉冲周期采样点
-                 num_nodes: int = 3,  # 雷达视图数
-                 d_model: int = 128,  # 特征维度D
-                 mlp_ratio: int = 4,  # 隐藏层维度倍率
-                 nhead: int = 8,      # 注意力头数A
-                 num_blocks: int = 4, # 编码模块堆叠数
-                 num_classes: int = 10,  # 干扰样式类别数
-                 dropout: float = 0.1):
-        
+                input_dim: int = 2,
+                 input_period: int = 8,
+                 patch_size: int = 16,
+                 stride: int = 16,
+                 seq_len: int = 2000,
+                 num_nodes: int = 3,
+                 d_model: int = 128,
+                 mlp_ratio: int = 4,
+                 nhead: int = 8,
+                 num_blocks: int = 4,
+                 num_classes: int = 10,
+                 dropout: float = 0.1,
+                 use_denoise_stem: bool = False,
+                 use_tf_cross_attn: bool = False,
+                 use_node_co_attn: bool = False,
+                 use_node_reliability: bool = False,
+                 domain_fusion_type: str = "gate",
+                 cls_head: str = "linear",
+                 cosine_scale: float = 10.0):
+
         super().__init__()
-        self.num_groups = (seq_len - patch_size) // stride + 1
+        self.effective_seq_len = seq_len * input_period
+        self.num_groups = (self.effective_seq_len - patch_size) // stride + 1
+        self.spec_n_fft = min(max(32, patch_size * 8), self.effective_seq_len)
+        self.spec_hop = max(self.spec_n_fft // 4, 4)
+        self.spec_groups = (self.effective_seq_len - self.spec_n_fft) // self.spec_hop + 1
         self.d_model = d_model
         self.num_nodes = num_nodes
+        self.use_denoise_stem = use_denoise_stem
+        self.use_tf_cross_attn = use_tf_cross_attn
+        self.use_node_co_attn = use_node_co_attn
+        self.use_node_reliability = use_node_reliability
+        self.domain_fusion_type = domain_fusion_type
+        self.cls_head = cls_head
+        stem_dim = max(d_model // 2, 32)
 
-        # 1. 脉冲周期线性映射（3节点共享，仅处理周期维度）
-        self.period_linear = nn.Linear(input_period, 1)
+        if self.use_denoise_stem:
+            self.denoise_stems = nn.ModuleList([
+                IQDenoiseStem(input_dim=input_dim, hidden_dim=max(16, d_model // 8), dropout=min(0.1, dropout))
+                for _ in range(num_nodes)
+            ])
 
-        # 2. 独立1DCNN分块（每个节点1个）
-        self.patch_embeds = nn.ModuleList([
-            nn.Conv1d(in_channels=input_dim, out_channels=d_model, 
-                      kernel_size=patch_size, stride=stride) 
+        # 时域分支
+        self.node_stems = nn.ModuleList([
+            TemporalConvStem(input_dim=input_dim, hidden_dim=stem_dim, dropout=dropout)
             for _ in range(num_nodes)
         ])
-
-        # 3. 独立位置编码（每个节点1个，文档公式5-1）
+        self.patch_embeds = nn.ModuleList([
+            nn.Conv1d(in_channels=stem_dim, out_channels=d_model,
+                      kernel_size=patch_size, stride=stride)
+            for _ in range(num_nodes)
+        ])
         self.pos_encs = nn.ModuleList([
             PositionalEncoding(d_model, num_nodes=1, num_groups=self.num_groups)
             for _ in range(num_nodes)
         ])
-
-        # 4. 独立Transformer Block（每个节点1个，文档第31段“多模块堆叠”）
         self.node_blocks = nn.ModuleList([
             nn.Sequential(*[
-                Block(d_model, nhead, mlp_ratio, drop=dropout,attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm) for _ in range(num_blocks)
+                Block(d_model, nhead, mlp_ratio, proj_drop=dropout, attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
+                for _ in range(num_blocks)
             ]) for _ in range(num_nodes)
         ])
 
-        # 5. 节点特征加权融合
-        self.node_fusion = nn.Linear(num_nodes, 1)
+        # 频域分支
+        self.spec_embeds = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(self.spec_n_fft),
+                nn.Linear(self.spec_n_fft, d_model),
+                nn.GELU(),
+            ) for _ in range(num_nodes)
+        ])
+        self.spec_pos_encs = nn.ModuleList([
+            PositionalEncoding(d_model, num_nodes=1, num_groups=self.spec_groups)
+            for _ in range(num_nodes)
+        ])
+        self.spec_blocks = nn.ModuleList([
+            nn.Sequential(*[
+                Block(d_model, nhead, mlp_ratio, proj_drop=dropout, attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
+                for _ in range(max(1, num_blocks - 1))
+            ]) for _ in range(num_nodes)
+        ])
+        if self.use_tf_cross_attn:
+            self.time_freq_cross_blocks = nn.ModuleList([
+                TimeFreqCrossAttentionBlock(d_model, nhead, dropout=dropout, mlp_ratio=mlp_ratio)
+                for _ in range(num_nodes)
+            ])
 
-        # 6. 分类头
-        self.classifier = nn.Sequential(
+        # 节点内时频融合 + 节点间融合
+        if domain_fusion_type == "gated_interaction":
+            fusion_factory = lambda: GatedInteractionFusion(d_model)
+        elif domain_fusion_type == "cross_gated_interaction":
+            fusion_factory = lambda: CrossGatedInteractionFusion(d_model)
+        else:
+            fusion_factory = lambda: DomainFeatureFusion(d_model)
+        self.domain_fusions = nn.ModuleList([fusion_factory() for _ in range(num_nodes)])
+        if self.use_node_co_attn:
+            self.node_co_attn = CrossNodeCoAttentionBlock(d_model, nhead, dropout=dropout, mlp_ratio=mlp_ratio)
+        if self.use_node_reliability:
+            self.node_fusion = ReliabilityAwareNodeFusion(d_model, stat_dim=4)
+        else:
+            self.node_fusion = DynamicNodeFeatureFusion(d_model)
+
+        # 判别特征头：供中心损失约束的 embedding
+        self.embedding_head = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, num_classes)
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
+        if cls_head == "cosine":
+            self.classifier = CosineClassifier(d_model, num_classes, init_scale=cosine_scale)
+        else:
+            self.classifier = nn.Linear(d_model, num_classes)
+
+    def _extract_node_features(self, x):
+        N, num_nodes, _, _, _ = x.shape
+        node_features = []
+        node_stats = []
+
+        x = flatten_periods_as_sequence(x)
+        if self.use_denoise_stem:
+            denoised_nodes = []
+            for i in range(num_nodes):
+                node_x = self.denoise_stems[i](x[:, i].permute(0, 2, 1)).permute(0, 2, 1)
+                denoised_nodes.append(node_x.unsqueeze(1))
+            x = torch.cat(denoised_nodes, dim=1)
+        spec = build_complex_spectrogram(x, n_fft=self.spec_n_fft, hop_length=self.spec_hop)
+
+        for i in range(num_nodes):
+            time_x = x[:, i].permute(0, 2, 1)
+            time_x = self.node_stems[i](time_x)
+            time_x = self.patch_embeds[i](time_x).permute(0, 2, 1)
+            time_x = self.pos_encs[i](time_x.unsqueeze(1)).squeeze(1)
+            time_x = self.node_blocks[i](time_x)
+
+            freq_x = self.spec_embeds[i](spec[:, i])
+            freq_x = self.spec_pos_encs[i](freq_x.unsqueeze(1)).squeeze(1)
+            freq_x = self.spec_blocks[i](freq_x)
+            if self.use_tf_cross_attn:
+                time_x = self.time_freq_cross_blocks[i](time_x, freq_x)
+
+            time_feat = time_x.mean(dim=1)
+            freq_feat = freq_x.mean(dim=1)
+
+            fused_feat = self.domain_fusions[i](time_feat, freq_feat)
+            node_features.append(fused_feat.unsqueeze(1))
+            node_signal = x[:, i]
+            complex_sig = torch.complex(node_signal[..., 0], node_signal[..., 1])
+            amp = torch.abs(complex_sig)
+            power_mean = torch.mean(amp ** 2, dim=1)
+            amp_std = torch.std(amp, dim=1)
+            spec_i = spec[:, i]
+            spec_mean = torch.mean(spec_i, dim=(1, 2)) + 1e-6
+            spec_peak_ratio = torch.amax(spec_i, dim=(1, 2)) / spec_mean
+            spec_prob = spec_i / torch.sum(spec_i, dim=(1, 2), keepdim=True).clamp_min(1e-6)
+            spec_entropy = -torch.sum(spec_prob * torch.log(spec_prob.clamp_min(1e-6)), dim=(1, 2))
+            spec_entropy = spec_entropy / math.log(float(spec_i.shape[1] * spec_i.shape[2]))
+            node_stats.append(torch.stack([power_mean, amp_std, spec_peak_ratio, 1.0 - spec_entropy], dim=1).unsqueeze(1))
+
+        node_features = torch.cat(node_features, dim=1)
+        node_stats = torch.cat(node_stats, dim=1)
+        return node_features, node_stats
+
+    def forward_features(self, x):
+        node_features, node_stats = self._extract_node_features(x)
+        fused_x = node_features
+        if self.use_node_co_attn:
+            fused_x = self.node_co_attn(fused_x)
+        if self.use_node_reliability:
+            fused_x, _ = self.node_fusion(fused_x, node_stats)
+        else:
+            fused_x = self.node_fusion(fused_x)
+        return self.embedding_head(fused_x)
+
+    def forward_with_features(self, x):
+        features = self.forward_features(x)
+        return self.classifier(features), features
+
+    def forward_with_details(self, x):
+        node_features, node_stats = self._extract_node_features(x)
+        if self.use_node_co_attn:
+            node_features = self.node_co_attn(node_features)
+        if self.use_node_reliability:
+            fused_global, node_weights = self.node_fusion(node_features, node_stats)
+        else:
+            fused_global = self.node_fusion(node_features)
+            node_weights = None
+        features = self.embedding_head(fused_global)
+        return self.classifier(features), features, node_features, node_weights
 
     def forward(self, x):
-        # 输入x: (N, 3, 2000, 2, 8)
-        N, num_nodes, seq_len, input_dim, _ = x.shape
-        node_features = []  # 存储每个节点的特征
-
-        # 1. 脉冲周期映射：(N,3,2000,2,8)→(N,3,2000,2)
-        x = self.period_linear(x.permute(0,1,2,3,4)).squeeze(-1)
-
-        # 2. 每个节点独立提取特征
-        for i in range(num_nodes):
-            # 取第i个节点数据：(N,2000,2)
-            node_x = x[:, i, :, :]
-            # 1DCNN分块：(N,2,2000)→(N,d_model,num_groups)→(N,num_groups,d_model)
-            node_x = self.patch_embeds[i](node_x.permute(0,2,1)).permute(0,2,1)
-            # 位置编码：(N,num_groups,d_model)
-            node_x = self.pos_encs[i](node_x.unsqueeze(1)).squeeze(1)
-            # Transformer提取特征：(N,num_groups,d_model)
-            node_x = self.node_blocks[i](node_x)
-            # 全局池化：(N,d_model)
-            node_x = node_x.mean(dim=1)
-            node_features.append(node_x.unsqueeze(1))  # (N,1,d_model)
-
-        # 3. 节点特征融合：(N,3,d_model)→(N,1,d_model)→(N,d_model)
-        fused_x = torch.cat(node_features, dim=1)  # (N,3,d_model)
-        fused_x = self.node_fusion(fused_x.permute(0,2,1)).squeeze(-1)  # (N,d_model)
-
-        # 4. 分类
-        return self.classifier(fused_x)
+        return self.classifier(self.forward_features(x))
 
 # -------------------------- 方案4：独立Transformer+分类器→投票融合 --------------------------
 class NodeClassifier(nn.Module):
@@ -563,7 +977,7 @@ class NodeClassifier(nn.Module):
 
         # 4. Transformer Block
         self.blocks = nn.ModuleList([
-            Block(d_model, nhead, mlp_ratio, drop=dropout,attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
+            Block(d_model, nhead, mlp_ratio, proj_drop=dropout, attn_drop=dropout, drop_path=dropout, qkv_bias=True, norm_layer=nn.LayerNorm)
             for i in range(num_blocks)])
 
         # 5. 分类头
